@@ -98,6 +98,7 @@
 #include <map>
 #include <limits>
 #include <string>
+#include <fstream>
 
 using namespace solidity;
 using namespace solidity::langutil;
@@ -1654,6 +1655,46 @@ void CompilerStack::generateEVMFromIR(ContractDefinition const& _contract)
 	solAssert(!compiledContract.yulIROptimized->empty());
 	if (!compiledContract.object.bytecode.empty())
 		return;
+
+	// Enable the cgir processing if requested
+	const char* cgir = std::getenv("CGIR");
+	if (cgir != nullptr)
+	{
+		// re-parse the IR
+		YulStack cgStack = loadGeneratedIR(*compiledContract.yulIROptimized);
+
+		// prepare output
+		auto cgirPath = boost::filesystem::path(cgir) / _contract.name();
+		boost::filesystem::remove_all(cgirPath);
+		boost::filesystem::create_directories(cgirPath);
+
+		// dump out source
+		std::ofstream outSrcFile((cgirPath / "original.yul").string());
+		solAssert(outSrcFile.is_open());
+		outSrcFile << *compiledContract.yulIROptimized;
+		outSrcFile.close();
+
+		// dump out CFG
+		std::ofstream outCfgFile((cgirPath / "original.json").string());
+		solAssert(outCfgFile.is_open());
+		outCfgFile << cgStack.cfgJson().dump(4);
+		outCfgFile.close();
+
+		// call the transformer
+		auto command = std::format("cgir {} {}", cgirPath.string(), _contract.fullyQualifiedName());
+		auto rv = std::system(command.c_str());
+		solAssert(rv == 0);
+
+		// read in the translated source
+		std::ifstream inFile((cgirPath / "transformed.yul").string());
+		solAssert(inFile.is_open());
+		std::stringstream buffer;
+		buffer << inFile.rdbuf();
+		inFile.close();
+
+		// update the code
+		compiledContract.yulIROptimized = buffer.str();
+	}
 
 	// Re-parse the Yul IR in EVM dialect
 	YulStack stack = loadGeneratedIR(*compiledContract.yulIROptimized);
