@@ -172,6 +172,8 @@ private:
 
 	void reportUnimplementedFeatureError(langutil::UnimplementedFeatureError const& _error);
 
+	Json exportObject(Object const& _object) const;
+
 	Language m_language = Language::Assembly;
 	langutil::EVMVersion m_evmVersion;
 	std::optional<uint8_t> m_eofVersion;

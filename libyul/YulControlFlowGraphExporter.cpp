@@ -21,9 +21,9 @@
 
 #include <libsolutil/Algorithms.h>
 #include <libsolutil/Numeric.h>
+#include <libsolutil/Visitor.h>
 
 #include <range/v3/view/enumerate.hpp>
-#include <range/v3/view/map.hpp>
 #include <range/v3/view/transform.hpp>
 
 using namespace solidity;
@@ -31,201 +31,280 @@ using namespace solidity::langutil;
 using namespace solidity::util;
 using namespace solidity::yul;
 
-YulControlFlowGraphExporter::YulControlFlowGraphExporter(ControlFlow const& _controlFlow, ControlFlowLiveness const* _liveness): m_controlFlow(_controlFlow), m_liveness(_liveness)
+Json YulControlFlowGraphExporter::exportLiteral(Literal const& _literal)
 {
+	Json result = Json::object();
+	switch (_literal.kind)
+	{
+	case LiteralKind::Boolean:
+	{
+		result["type"] = "Boolean";
+		result["value"] = _literal.value.value() ? "true" : "false";
+		break;
+	}
+	case LiteralKind::Number:
+	{
+		result["type"] = "Number";
+		result["value"] = toCompactHexWithPrefix(_literal.value.value());
+		break;
+	}
+	case LiteralKind::String:
+	{
+		result["type"] = "String";
+		result["value"] = _literal.value.builtinStringLiteralValue();
+		break;
+	}
+	}
+	return result;
 }
 
-std::string YulControlFlowGraphExporter::varToString(SSACFG const& _cfg, SSACFG::ValueId _var)
+Json YulControlFlowGraphExporter::exportExpression(Expression const& _expr)
 {
-	if (_var.value == std::numeric_limits<size_t>::max())
-		return std::string("INVALID");
-	auto const& info = _cfg.valueInfo(_var);
-	return std::visit(
-		util::GenericVisitor{
-			[&](SSACFG::UnreachableValue const&) -> std::string {
-				return "[unreachable]";
+	Json result = Json::object();
+	std::visit(
+		GenericVisitor{
+			[&](const FunctionCall& call)
+			{
+				std::visit(
+					GenericVisitor{
+						[&](const Identifier& ident)
+						{
+							result["type"] = "FunctionCall";
+							result["op"] = ident.name.str();
+							result["arguments"] = exportExpressionList(call.arguments);
+						},
+						[&](const BuiltinName& builtin)
+						{
+							result["type"] = "BuiltinCall";
+							result["op"] = m_dialect.builtin(builtin.handle).name;
+							result["arguments"] = exportExpressionList(call.arguments);
+						},
+					},
+					call.functionName);
 			},
-			[&](SSACFG::LiteralValue const& _literal) {
-				return toCompactHexWithPrefix(_literal.value);
+			[&](const Identifier& ident)
+			{
+				result["type"] = "Identifier";
+				result["name"] = ident.name.str();
 			},
-			[&](auto const&) {
-				return "v" + std::to_string(_var.value);
-			}
+			[&](const Literal& literal)
+			{
+				result["type"] = "Literal";
+				result["data"] = exportLiteral(literal);
+			},
 		},
-		info
-	);
+		_expr);
+	return result;
+}
+
+Json YulControlFlowGraphExporter::exportExpressionList(std::vector<Expression> const& _exprs)
+{
+	Json result = Json::array();
+	for (auto const& expr: _exprs)
+		result.push_back(exportExpression(expr));
+	return result;
+}
+
+Json YulControlFlowGraphExporter::exportValue(SSACFG const& _cfg, SSACFG::ValueId _valueId)
+{
+	yulAssert(_valueId.value != std::numeric_limits<size_t>::max());
+
+	Json result = Json::object();
+	auto const& info = _cfg.valueInfo(_valueId);
+	std::visit(
+		GenericVisitor{
+			[&](SSACFG::UnreachableValue const&) { result["type"] = "Unreachable"; },
+			[&](SSACFG::LiteralValue const& _literal)
+			{
+				result["type"] = "Literal";
+				result["value"] = toCompactHexWithPrefix(_literal.value);
+			},
+			[&](SSACFG::VariableValue const&)
+			{
+				result["type"] = "Variable";
+				result["id"] = _valueId.value;
+			},
+			[&](SSACFG::PhiValue const&)
+			{
+				result["type"] = "Variable"; // yes, intentionally keep it as Variable type
+				result["id"] = _valueId.value;
+			},
+		},
+		info);
+	return result;
+}
+
+Json YulControlFlowGraphExporter::exportValueList(SSACFG const& _cfg, std::vector<SSACFG::ValueId> const& _values)
+{
+	Json result = Json::array();
+	for (auto const& value: _values)
+		result.push_back(exportValue(_cfg, value));
+	return result;
+}
+
+Json YulControlFlowGraphExporter::exportOperation(SSACFG const& _cfg, SSACFG::Operation const& _operation)
+{
+	Json result = Json::object();
+	std::visit(
+		GenericVisitor{
+			[&](SSACFG::Call const& _call)
+			{
+				auto const& calleeName = _call.call.get().functionName;
+				auto const& calleeIdent = _call.function.get().name;
+				yulAssert(std::holds_alternative<Identifier>(calleeName));
+				yulAssert(std::get<Identifier>(calleeName).name == calleeIdent);
+
+				result["type"] = "FunctionCall";
+				result["op"] = calleeIdent.str();
+				result["arguments"] = exportExpressionList(_call.call.get().arguments);
+			},
+			[&](SSACFG::BuiltinCall const& _call)
+			{
+				auto const& calleeName = _call.call.get().functionName;
+				auto const& calleeIdent = _call.builtin.get().name;
+				yulAssert(std::holds_alternative<BuiltinName>(calleeName));
+				yulAssert(m_dialect.builtin(std::get<BuiltinName>(calleeName).handle).name == calleeIdent);
+
+				result["type"] = "BuiltinCall";
+				result["op"] = calleeIdent;
+				result["arguments"] = exportExpressionList(_call.call.get().arguments);
+			},
+			[&](SSACFG::LiteralAssignment const&)
+			{
+				yulAssert(_operation.inputs.size() == 1);
+				yulAssert(_cfg.isLiteralValue(_operation.inputs.back()));
+				result["type"] = "LiteralAssignment";
+			},
+		},
+		_operation.kind);
+
+	result["in"] = exportValueList(_cfg, _operation.inputs);
+	result["out"] = exportValueList(_cfg, _operation.outputs);
+	return result;
+}
+
+Json YulControlFlowGraphExporter::exportBlock(SSACFG const& _cfg, SSACFG::BlockId _blockId)
+{
+	Json result = Json::object();
+	auto const& block = _cfg.block(_blockId);
+
+	result["label"] = _blockId.value;
+	result["entries"] = block.entries | ranges::views::transform([](auto const& entry) { return entry.value; })
+						| ranges::to<Json::array_t>();
+
+	Json phi_nodes = Json::array();
+	for (auto const& phi: block.phis)
+	{
+		auto* phiInfo = std::get_if<SSACFG::PhiValue>(&_cfg.valueInfo(phi));
+		yulAssert(phiInfo);
+
+		Json phiJson = Json::object();
+		phiJson["in"] = exportValueList(_cfg, phiInfo->arguments);
+		phiJson["out"] = exportValue(_cfg, phi);
+		phi_nodes.push_back(phiJson);
+	}
+	result["phi_nodes"] = phi_nodes;
+
+	Json instructions = Json::array();
+	for (auto const& operation: block.operations)
+		instructions.push_back(exportOperation(_cfg, operation));
+	result["instructions"] = instructions;
+
+	Json exit = Json::object();
+	std::visit(
+		util::GenericVisitor{
+			[&](SSACFG::BasicBlock::MainExit const&) { exit["type"] = "MainExit"; },
+			[&](SSACFG::BasicBlock::Jump const& _jump)
+			{
+				exit["type"] = "Jump";
+				exit["target"] = _jump.target.value;
+			},
+			[&](SSACFG::BasicBlock::ConditionalJump const& _conditionalJump)
+			{
+				exit["type"] = "ConditionalJump";
+				exit["cond"] = exportValue(_cfg, _conditionalJump.condition);
+				exit["target0"] = _conditionalJump.zero.value;
+				exit["target1"] = _conditionalJump.nonZero.value;
+			},
+			[&](SSACFG::BasicBlock::FunctionReturn const& _return)
+			{
+				exit["type"] = "FunctionReturn";
+				exit["return_values"] = exportValueList(_cfg, _return.returnValues);
+			},
+			[&](SSACFG::BasicBlock::Terminated const&) { exit["type"] = "Terminated"; },
+			[&](SSACFG::BasicBlock::JumpTable const&) { yulAssert(false); }},
+		block.exit);
+	result["exit"] = exit;
+
+	return result;
+}
+
+Json YulControlFlowGraphExporter::exportFunction(SSACFG const& _cfg)
+{
+	Json result = Json::object();
+
+	Json params = Json::array();
+	for (auto const& [argVar, argId]: _cfg.arguments)
+	{
+		Json paramJson = Json::object();
+		paramJson["name"] = argVar.get().name.str();
+		paramJson["repr"] = exportValue(_cfg, argId);
+		params.push_back(paramJson);
+	}
+	result["params"] = params;
+
+	Json rets = Json::array();
+	for (auto const& retVar: _cfg.returns)
+	{
+		rets.push_back(retVar.get().name.str());
+	}
+	result["returns"] = rets;
+
+	Json blocks = Json::array();
+	util::BreadthFirstSearch<SSACFG::BlockId> bfs{{{_cfg.entry}}};
+	bfs.run(
+		[&](auto _blockId, auto _addChild)
+		{
+			blocks.push_back(exportBlock(_cfg, _blockId));
+
+			// add children for bfs
+			auto const& block = _cfg.block(_blockId);
+			std::visit(
+				util::GenericVisitor{
+					[&](SSACFG::BasicBlock::MainExit const&) {},
+					[&](SSACFG::BasicBlock::Jump const& _jump) { _addChild(_jump.target); },
+					[&](SSACFG::BasicBlock::ConditionalJump const& _conditionalJump)
+					{
+						_addChild(_conditionalJump.zero);
+						_addChild(_conditionalJump.nonZero);
+					},
+					[&](SSACFG::BasicBlock::FunctionReturn const&) {},
+					[&](SSACFG::BasicBlock::Terminated const&) {},
+					[&](SSACFG::BasicBlock::JumpTable const&) { yulAssert(false); }},
+				block.exit);
+		});
+	result["blocks"] = blocks;
+
+	result["entry"] = _cfg.entry.value;
+	result["exits"] = _cfg.exits | ranges::views::transform([](auto const& entry) { return entry.value; })
+					  | ranges::to<Json::array_t>();
+
+	return result;
 }
 
 Json YulControlFlowGraphExporter::run()
 {
-	if (m_liveness)
-		yulAssert(&m_liveness->controlFlow.get() == &m_controlFlow);
+	Json result = Json::object();
+	result["main"] = exportFunction(*m_controlFlow.mainGraph);
 
-	Json yulObjectJson = Json::object();
-	yulObjectJson["blocks"] = exportBlock(*m_controlFlow.mainGraph, SSACFG::BlockId{0}, m_liveness ? m_liveness->mainLiveness.get() : nullptr);
-
-	Json functionsJson = Json::object();
-	size_t index = 0;
+	Json subs = Json::object();
 	for (auto const& [function, functionGraph]: m_controlFlow.functionGraphMapping)
-		functionsJson[function->name.str()] = exportFunction(*functionGraph, m_liveness ? m_liveness->functionLiveness[index++].get() : nullptr);
-	yulObjectJson["functions"] = functionsJson;
-
-	return yulObjectJson;
-}
-
-Json YulControlFlowGraphExporter::exportFunction(SSACFG const& _cfg, SSACFGLiveness const* _liveness)
-{
-	Json functionJson = Json::object();
-	functionJson["type"] = "Function";
-	functionJson["entry"] = "Block" + std::to_string(_cfg.entry.value);
-	static auto constexpr argsTransform = [](auto const& _arg) { return fmt::format("v{}", std::get<1>(_arg).value); };
-	functionJson["arguments"] = _cfg.arguments | ranges::views::transform(argsTransform) | ranges::to<std::vector>;
-	functionJson["numReturns"] = _cfg.returns.size();
-	functionJson["blocks"] = exportBlock(_cfg, _cfg.entry, _liveness);
-	return functionJson;
-}
-
-Json YulControlFlowGraphExporter::exportBlock(SSACFG const& _cfg, SSACFG::BlockId _entryId, SSACFGLiveness const* _liveness)
-{
-	Json blocksJson = Json::array();
-	util::BreadthFirstSearch<SSACFG::BlockId> bfs{{{_entryId}}};
-	bfs.run([&](SSACFG::BlockId _blockId, auto _addChild) {
-		auto const& block = _cfg.block(_blockId);
-		// Convert current block to JSON
-		Json blockJson = toJson(_cfg, _blockId, _liveness);
-
-		Json exitBlockJson = Json::object();
-		std::visit(util::GenericVisitor{
-			[&](SSACFG::BasicBlock::MainExit const&) {
-				exitBlockJson["type"] = "MainExit";
-			},
-			[&](SSACFG::BasicBlock::Jump const& _jump)
-			{
-				exitBlockJson["targets"] = { "Block" + std::to_string(_jump.target.value) };
-				exitBlockJson["type"] = "Jump";
-				_addChild(_jump.target);
-			},
-			[&](SSACFG::BasicBlock::ConditionalJump const& _conditionalJump)
-			{
-				exitBlockJson["targets"] = { "Block" + std::to_string(_conditionalJump.zero.value), "Block" + std::to_string(_conditionalJump.nonZero.value) };
-				exitBlockJson["cond"] = varToString(_cfg, _conditionalJump.condition);
-				exitBlockJson["type"] = "ConditionalJump";
-
-				_addChild(_conditionalJump.zero);
-				_addChild(_conditionalJump.nonZero);
-			},
-			[&](SSACFG::BasicBlock::FunctionReturn const& _return) {
-				exitBlockJson["returnValues"] = toJson(_cfg, _return.returnValues);
-				exitBlockJson["type"] = "FunctionReturn";
-			},
-			[&](SSACFG::BasicBlock::Terminated const&) {
-				exitBlockJson["type"] = "Terminated";
-			},
-			[&](SSACFG::BasicBlock::JumpTable const&) {
-				yulAssert(false);
-			}
-		}, block.exit);
-		blockJson["exit"] = exitBlockJson;
-		blocksJson.emplace_back(blockJson);
-	});
-
-	return blocksJson;
-}
-
-Json YulControlFlowGraphExporter::toJson(SSACFG const& _cfg, SSACFG::BlockId _blockId, SSACFGLiveness const* _liveness)
-{
-	auto const valueToString = [&](SSACFG::ValueId const& valueId) { return varToString(_cfg, valueId); };
-
-	Json blockJson = Json::object();
-	auto const& block = _cfg.block(_blockId);
-
-	blockJson["id"] = "Block" + std::to_string(_blockId.value);
-	if (_liveness)
 	{
-		Json livenessJson = Json::object();
-		livenessJson["in"] = _liveness->liveIn(_blockId)
-			| ranges::views::transform(valueToString)
-			| ranges::to<Json::array_t>();
-		livenessJson["out"] = _liveness->liveOut(_blockId)
-			| ranges::views::transform(valueToString)
-			| ranges::to<Json::array_t>();
-		blockJson["liveness"] = livenessJson;
+		auto name = function->name.str();
+		yulAssert(!subs.contains(name));
+		subs[name] = exportFunction(*functionGraph);
 	}
-	blockJson["instructions"] = Json::array();
-	if (!block.phis.empty())
-	{
-		blockJson["entries"] = block.entries
-			| ranges::views::transform([](auto const& entry) { return "Block" + std::to_string(entry.value); })
-			| ranges::to<Json::array_t>();
-		for (auto const& phi: block.phis)
-		{
-			auto* phiInfo = std::get_if<SSACFG::PhiValue>(&_cfg.valueInfo(phi));
-			yulAssert(phiInfo);
-			Json phiJson = Json::object();
-			phiJson["op"] = "PhiFunction";
-			phiJson["in"] = toJson(_cfg, phiInfo->arguments);
-			phiJson["out"] = toJson(_cfg, std::vector<SSACFG::ValueId>{phi});
-			blockJson["instructions"].push_back(phiJson);
-		}
-	}
-	for (auto const& operation: block.operations)
-		blockJson["instructions"].push_back(toJson(blockJson, _cfg, operation));
+	result["functions"] = subs;
 
-	return blockJson;
-}
-
-Json YulControlFlowGraphExporter::toJson(Json& _ret, SSACFG const& _cfg, SSACFG::Operation const& _operation)
-{
-	Json opJson = Json::object();
-	std::visit(GenericVisitor{
-		[&](SSACFG::Call const& _call)
-		{
-			_ret["type"] = "FunctionCall";
-			opJson["op"] = _call.function.get().name.str();
-		},
-		[&](SSACFG::LiteralAssignment const&)
-		{
-			yulAssert(_operation.inputs.size() == 1);
-			yulAssert(_cfg.isLiteralValue(_operation.inputs.back()));
-			opJson["op"] = "LiteralAssignment";
-		},
-		[&](SSACFG::BuiltinCall const& _call)
-		{
-			_ret["type"] = "BuiltinCall";
-			Json builtinArgsJson = Json::array();
-			auto const& builtin = _call.builtin.get();
-			if (!builtin.literalArguments.empty())
-			{
-				auto const& functionCallArgs = _call.call.get().arguments;
-				for (size_t i = 0; i < builtin.literalArguments.size(); ++i)
-				{
-					std::optional<LiteralKind> const& argument = builtin.literalArguments[i];
-					if (argument.has_value() && i < functionCallArgs.size())
-					{
-						// The function call argument at index i must be a literal if builtin.literalArguments[i] is not nullopt
-						yulAssert(std::holds_alternative<Literal>(functionCallArgs[i]));
-						builtinArgsJson.push_back(formatLiteral(std::get<Literal>(functionCallArgs[i])));
-					}
-				}
-			}
-
-			if (!builtinArgsJson.empty())
-				opJson["literalArgs"] = builtinArgsJson;
-
-			opJson["op"] = _call.builtin.get().name;
-		},
-	}, _operation.kind);
-
-	opJson["in"] = toJson(_cfg, _operation.inputs);
-	opJson["out"] = toJson(_cfg, _operation.outputs);
-
-	return opJson;
-}
-
-Json YulControlFlowGraphExporter::toJson(SSACFG const& _cfg, std::vector<SSACFG::ValueId> const& _values)
-{
-	Json ret = Json::array();
-	for (auto const& value: _values)
-		ret.push_back(varToString(_cfg, value));
-	return ret;
+	return result;
 }

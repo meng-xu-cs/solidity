@@ -384,7 +384,55 @@ Json YulStack::astJson() const
 	yulAssert(m_stackState >= Parsed);
 	yulAssert(m_parserResult, "");
 	yulAssert(m_parserResult->hasCode(), "");
-	return  m_parserResult->toJson();
+	return m_parserResult->toJson();
+}
+
+Json YulStack::exportObject(Object const& _object) const
+{
+	// FIXME: we should not regenerate the cfg, but for now this is sufficient for testing purposes
+	//
+	// with this set to `true`, assignments of the type `let x := 42` are preserved and added as assignment
+	// operations to the control flow graphs
+	bool constexpr keepLiteralAssignments = true;
+	// NOTE: The block Ids are reset for each object
+	std::unique_ptr<ControlFlow> controlFlow = SSAControlFlowGraphBuilder::build(
+		*_object.analysisInfo,
+		languageToDialect(m_language, m_evmVersion, m_eofVersion),
+		_object.code()->root(),
+		keepLiteralAssignments);
+	YulControlFlowGraphExporter exporter(dialect(), *controlFlow);
+
+	// export the object
+	Json result = Json::object();
+	result["name"] = _object.name;
+	result["core"] = exporter.run();
+
+	// export sub items as well
+	Json subs = Json::array();
+	for (std::shared_ptr<ObjectNode> const& node: _object.subObjects)
+	{
+		if (auto const* code = dynamic_cast<Object const*>(node.get()))
+		{
+			auto subCode = exportObject(*code);
+			subCode["type"] = "Code";
+			subs.push_back(subCode);
+		}
+		else if (auto const* data = dynamic_cast<Data const*>(node.get()))
+		{
+			Json subData = Json::object();
+			subData["type"] = "Data";
+			subData["name"] = data->name;
+			subData["item"] = util::toHex(data->data);
+			subs.push_back(subData);
+		}
+		else
+		{
+			yulAssert(false);
+		}
+	}
+	result["subs"] = subs;
+
+	return result;
 }
 
 Json YulStack::cfgJson() const
@@ -392,44 +440,7 @@ Json YulStack::cfgJson() const
 	yulAssert(m_parserResult, "");
 	yulAssert(m_parserResult->hasCode(), "");
 	yulAssert(m_parserResult->analysisInfo, "");
-	// FIXME: we should not regenerate the cfg, but for now this is sufficient for testing purposes
-	auto exportCFGFromObject = [&](Object const& _object) -> Json {
-		// with this set to `true`, assignments of the type `let x := 42` are preserved and added as assignment
-		// operations to the control flow graphs
-		bool constexpr keepLiteralAssignments = true;
-		// NOTE: The block Ids are reset for each object
-		std::unique_ptr<ControlFlow> controlFlow = SSAControlFlowGraphBuilder::build(
-			*_object.analysisInfo,
-			languageToDialect(m_language, m_evmVersion, m_eofVersion),
-			_object.code()->root(),
-			keepLiteralAssignments
-		);
-		std::unique_ptr<ControlFlowLiveness> liveness = std::make_unique<ControlFlowLiveness>(*controlFlow);
-		YulControlFlowGraphExporter exporter(*controlFlow, liveness.get());
-		return exporter.run();
-	};
-
-	std::function<Json(std::vector<std::shared_ptr<ObjectNode>>)> exportCFGFromSubObjects;
-	exportCFGFromSubObjects = [&](std::vector<std::shared_ptr<ObjectNode>> _subObjects) -> Json {
-		Json subObjectsJson = Json::object();
-		for (std::shared_ptr<ObjectNode> const& subObjectNode: _subObjects)
-			if (Object const* subObject = dynamic_cast<Object const*>(subObjectNode.get()))
-			{
-				subObjectsJson[subObject->name] = exportCFGFromObject(*subObject);
-				subObjectsJson["type"] = "subObject";
-				if (!subObject->subObjects.empty())
-					subObjectsJson[subObject->name]["subObjects"] = exportCFGFromSubObjects(subObject->subObjects);
-			}
-		return subObjectsJson;
-	};
-
-	Object const& object = *m_parserResult.get();
-	Json jsonObject = Json::object();
-	jsonObject[object.name] = exportCFGFromObject(object);
-	jsonObject["type"] = "Object";
-	if (!object.subObjects.empty())
-		jsonObject[object.name]["subObjects"] = exportCFGFromSubObjects(object.subObjects);
-	return jsonObject;
+	return exportObject(*m_parserResult);
 }
 
 std::shared_ptr<Object> YulStack::parserResult() const
